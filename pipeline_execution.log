@@ -1,0 +1,25 @@
+2026-11-09 18:18:02,011 [INFO] Found credentials in shared credentials file: ~/.aws/credentials
+2026-11-09 18:18:02,134 [INFO] ==================================================================
+2026-11-09 18:18:02,134 [INFO]    eBPF -> SAGEMAKER -> EKS AUTOMATED QUARANTINE PIPELINE ONLINE 
+2026-11-09 18:18:02,134 [INFO] ==================================================================
+2026-11-09 18:18:02,134 [INFO] Target Namespace : prod-app
+2026-11-09 18:18:02,134 [INFO] Target Pods      : ['web-target-5757576cc8-2qrt7web-target-5757576cc8-lt2bp', 'web-target-5757576cc8-rfc54']
+2026-11-09 18:18:02,135 [INFO] SageMaker Endpoint: eks-isolation-forest-endpoint
+2026-11-09 18:18:02,135 [INFO] Remediation Lambda: EKS-PodQuarantiner
+2026-11-09 18:18:02,135 [INFO] ------------------------------------------------------------------
+
+2026-11-09 18:18:07,095 [WARNING] All active pods have been quarantined! Stopping stream.
+2026-11-09 18:24:42,557 [INFO] Found credentials in shared credentials file: ~/.aws/credentials
+2026-11-09 18:24:42,665 [INFO] ==================================================================
+2026-11-09 18:24:42,665 [INFO]    eBPF -> SAGEMAKER -> EKS AUTOMATED QUARANTINE PIPELINE ONLINE 
+2026-11-09 18:24:42,665 [INFO] ==================================================================
+2026-11-09 18:24:42,665 [INFO] Target Namespace : prod-app
+2026-11-09 18:24:42,666 [INFO] Target Pods      : ['web-target-5757576cc8-2qrt7', 'web-target-5757576cc8-lt2bp', 'web-target-5757576cc8-rfc54']
+2026-11-09 18:24:42,666 [INFO] SageMaker Endpoint: eks-isolation-forest-endpoint
+2026-11-09 18:24:42,666 [INFO] Remediation Lambda: EKS-PodQuarantiner
+2026-11-09 18:24:42,666 [INFO] ------------------------------------------------------------------
+
+2026-11-09 18:24:43,024 [CRITICAL] [ALERT: ANOMALY DETECTED] Pod: 'web-target-5757576cc8-2qrt7' | Score: -0.1178 | Latency: 357.9ms | Features: [18, 299, 404, 23, 4.48, 0]
+2026-11-09 18:24:45,307 [CRITICAL] [ALERT: ANOMALY DETECTED] Pod: 'web-target-5757576cc8-rfc54' | Score: -0.1425 | Latency: 27.4ms | Features: [6, 232, 935, 39, 13.91, 0]
+2026-11-09 18:24:47,652 [CRITICAL] [ALERT: ANOMALY DETECTED] Pod: 'web-target-5757576cc8-lt2bp' | Score: -0.1425 | Latency: 38.2ms | Features: [6, 534, 1484, 30, 7.28, 0]
+2026-11-09 18:24:49,928 [WARNING] All active pods have been quarantined! Stopping stream.

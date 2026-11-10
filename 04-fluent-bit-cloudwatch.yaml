@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aws-fluent-bit
+  namespace: sec-telemetry
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: aws-fluent-bit-role
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: aws-fluent-bit-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: aws-fluent-bit-role
+subjects:
+  - kind: ServiceAccount
+    name: aws-fluent-bit
+    namespace: sec-telemetry
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aws-fluent-bit-config
+  namespace: sec-telemetry
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Parsers_File  parsers.conf
+        Log_Level     info
+
+    [INPUT]
+        Name              tail
+        Tag               falco.*
+        Path              /var/log/containers/*falco*.log
+        Parser            cri
+        DB                /tmp/flb_falco.db
+        Read_From_Head    On
+        Mem_Buf_Limit     10MB
+        Skip_Long_Lines   On
+
+    [OUTPUT]
+        Name                cloudwatch_logs
+        Match               falco.*
+        region              ap-south-1
+        log_group_name      /aws/eks/ebpf-runtime-security
+        log_stream_prefix   falco-events-
+        auto_create_group   true
+
+  parsers.conf: |
+    [PARSER]
+        Name        cri
+        Format      regex
+        Regex       ^(?<time>[^ ]+) (?<stream>stdout|stderr) (?<logtag>[^ ]*) (?<log>.*)$
+        Time_Key    time
+        Time_Format %Y-%m-%dT%H:%M:%S.%L%z
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aws-fluent-bit
+  namespace: sec-telemetry
+spec:
+  selector:
+    matchLabels:
+      app: aws-fluent-bit
+  template:
+    metadata:
+      labels:
+        app: aws-fluent-bit
+    spec:
+      serviceAccountName: aws-fluent-bit
+      containers:
+      - name: aws-fluent-bit
+        image: public.ecr.aws/aws-observability/aws-for-fluent-bit:latest
+        env:
+        - name: AWS_REGION
+          value: ap-south-1
+        volumeMounts:
+        - name: config
+          mountPath: /fluent-bit/etc/
+        - name: varlog
+          mountPath: /var/log
+      volumes:
+      - name: config
+        configMap:
+          name: aws-fluent-bit-config
+      - name: varlog
+        hostPath:
+          path: /var/log

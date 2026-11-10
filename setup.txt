@@ -1,0 +1,227 @@
+$REGION = "ap-south-1"
+$CLUSTER_NAME = "eks-sec-cluster"
+$ACCOUNT_ID = (aws sts get-caller-identity --query "Account" --output text)
+$S3_BUCKET = "eks-ebpf-telemetry-baseline-$ACCOUNT_ID"
+
+Write-Host "AWS Account ID: $ACCOUNT_ID" -ForegroundColor Cyan
+Write-Host "Target S3 Bucket: $S3_BUCKET" -ForegroundColor Cyan
+terraform init
+terraform apply -auto-approve
+
+aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME
+kubectl get nodes
+
+kubectl set env daemonset aws-node -n kube-system ENABLE_NETWORK_POLICY=true
+Set-Content -Path addon_config.json -Value '{"enableNetworkPolicy":"true"}'
+aws eks create-addon --cluster-name eks-sec-cluster --addon-name vpc-cni --configuration-values file://addon_config.json --resolve-conflicts OVERWRITE --region ap-south-1 
+aws eks wait addon-active --cluster-name eks-sec-cluster --addon-name vpc-cni --region ap-south-1
+
+kubectl rollout restart daemonset aws-node -n kube-system
+kubectl rollout status daemonset aws-node -n kube-system --timeout=120s
+kubectl get daemonset aws-node -n kube-system -o jsonpath="{.spec.template.spec.containers[*].name}"
+
+kubectl apply -f 01-namespaces-rbac.yaml
+kubectl apply -f 02-baseline-network-policy.yaml
+kubectl apply -f quarantine-policy.yaml
+kubectl apply -f 03-target-app.yaml
+
+kubectl rollout status deployment web-target -n prod-app --timeout=60s
+kubectl get pods -n prod-app -o wide
+
+# Expose deployment via LoadBalancer
+kubectl expose deployment web-target -n prod-app --type=LoadBalancer --name=web-target-lb --port=80 --target-port=80
+
+
+# Capture LoadBalancer Endpoint
+$env:LB_ENDPOINT = (kubectl get svc web-target-lb -n prod-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+if (-not $env:LB_ENDPOINT) {
+    $env:LB_ENDPOINT = (kubectl get svc web-target-lb -n prod-app -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+}
+
+Write-Host "LoadBalancer Endpoint Provisioned: http://$env:LB_ENDPOINT" -ForegroundColor Green
+
+LoadBalancer Endpoint Provisioned: http://af1d7a91d2aa040c5bffc4b4a055cf8a-666864140.ap-south-1.elb.amazonaws.com
+
+# Get Node IAM Role Name
+$NODE_ROLE = (aws iam list-roles --query "Roles[?contains(RoleName, 'ebpf_nodes')].RoleName" --output text).Split()[0]
+# Attach CloudWatch Agent Policy
+aws iam attach-role-policy --role-name $NODE_ROLE --policy-arn arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+# Create CloudWatch Log Group
+aws logs create-log-group --log-group-name /aws/eks/ebpf-runtime-security --region ap-south-1
+# Deploy Fluent Bit Manifest
+kubectl apply -f 04-fluent-bit-cloudwatch.yaml
+
+#Phase 2: Deploy eBPF Observability Engine (Falco)
+# 1. Add Falco Helm Repository
+helm repo add falcosecurity https://falcosecurity.github.io/charts
+helm repo update
+
+# 2. Install Falco with Modern eBPF Driver in Dedicated Namespace
+helm install falco falcosecurity/falco  --namespace sec-telemetry --set driver.kind=modern_ebpf --set json_output=true --set json_include_output_property=true --set tty=true
+
+# 3. Verify Falco DaemonSet Execution
+kubectl get pods -n sec-telemetry -o wide
+
+#Phase 3: Harvest eBPF Telemetry & Train Model Artifact
+python3 -m venv venv
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process 
+.\venv\Scripts\Activate.ps1
+pip install boto3
+
+
+#stream logs from all pods use below
+kubectl logs -f -l app=web-target -n prod-app --prefix --tail=20
+
+#Parallel Execution using Background Jobs (PowerShell 5.1)
+1..50 | ForEach-Object {
+    Start-Job -ScriptBlock {
+        (Invoke-WebRequest -Uri "http://af1d7a91d2aa040c5bffc4b4a055cf8a-666864140.ap-south-1.elb.amazonaws.com" -UseBasicParsing).StatusCode
+    }
+} | Get-Job | Receive-Job -Wait -AutoRemoveJob
+
+
+pip install scikit-learn pandas numpy requests boto3 joblib matplotlib sagemaker
+pip install sagemaker boto3 --upgrade
+
+#below is only for training the model
+python pipeline_collect_and_train.py
+#python pipeline_collect_and_train.py
+
+#due to sickit-learn incomatible in sagemaker use json model which works for any version
+python modelConversionToJson.py
+
+#generate inference.py, packages model.joblib, scaler.joblib, and inference.py into an updated model.tar.gz archive, tears down any existing SageMaker resources to prevent conflicts, uploads the tarball to S3, and deploys the fresh real-time endpoint.
+python deploy_sagemaker_endpoint.py
+
+
+python Test_sagemakerEndpoint.py
+
+kubectl apply -f lambda-quarantine-rbac.yaml
+
+Set-Content -Path lambda_trust.json -Value '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam create-role --role-name EKSAutoRemediationLambdaRole --assume-role-policy-document file://lambda_trust.json --region $REGION
+aws iam attach-role-policy --role-name EKSAutoRemediationLambdaRole --policy-arn arn:aws:iam::aws:policy/AmazonSageMakerFullAccess --region $REGION
+aws iam attach-role-policy --role-name EKSAutoRemediationLambdaRole --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole --region $REGION
+$LAMBDA_ROLE_ARN = (aws iam get-role --role-name EKSAutoRemediationLambdaRole --query "Role.Arn" --output text --region $REGION)
+aws eks create-access-entry --cluster-name $CLUSTER_NAME --principal-arn $LAMBDA_ROLE_ARN --region $REGION
+aws eks associate-access-policy --cluster-name $CLUSTER_NAME --principal-arn $LAMBDA_ROLE_ARN --policy-arn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy --access-scope type=cluster --region $REGION
+Set-Content -Path eks_lambda_policy.json -Value '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["eks:DescribeCluster","sts:GetCallerIdentity"],"Resource":"*"}]}'
+aws iam put-role-policy --role-name EKSAutoRemediationLambdaRole --policy-name EKSDescribeClusterPolicy --policy-document file://eks_lambda_policy.json
+
+# 1. Package script into zip archive
+Compress-Archive -Path eks_pod_quarantiner.py -DestinationPath lambda_function.zip -Force
+
+# 2. Deploy Lambda function
+aws lambda create-function --function-name EKS-PodQuarantiner --runtime python3.11 --role arn:aws:iam::712137512951:role/EKSAutoRemediationLambdaRole --handler eks_pod_quarantiner.lambda_handler   --zip-file fileb://lambda_function.zip --environment "Variables={EKS_CLUSTER_NAME=eks-sec-cluster}" --timeout 30 --region ap-south-1
+
+#only for re-run not during initial setup - to update the lambda function
+aws lambda update-function-code --function-name EKS-PodQuarantiner --zip-file fileb://lambda_function.zip --region ap-south-1 
+
+
+#verify lambda execution
+# 1. Save payload to file
+'{"pod_name": "web-target-5757576cc8-2qrt7", "namespace": "prod-app", "anomaly_score": -0.1651}' | Out-File -Encoding ascii payload.json
+
+# 2. Invoke Lambda using fileb://
+aws lambda invoke --function-name EKS-PodQuarantiner --payload fileb://payload.json --region ap-south-1 response.json
+
+# 3. View invocation response
+Get-Content response.json
+
+
+# 1. Check updated labels on the target pod
+kubectl get pod web-target-5757576cc8-2qrt7 -n prod-app --show-labels
+
+# 2. Confirm quarantine NetworkPolicy is active in prod-app
+kubectl get netpol quarantine-deny-all -n prod-app -o yaml
+
+kubectl exec -n prod-app web-target-5757576cc8-2qrt7 -- curl --connect-timeout 3 -sI https://aws.amazon.com  | Select-Object -First 1
+kubectl exec -n prod-app web-target-5757576cc8-lt2bp -- curl --connect-timeout 3 -sI https://aws.amazon.com  | Select-Object -First 1
+kubectl exec -n prod-app web-target-5757576cc8-rfc54 -- curl --connect-timeout 3 -sI https://aws.amazon.com  | Select-Object -First 1
+
+
+#remove labels before running end-end
+kubectl get pods -n prod-app --show-labels
+kubectl label pods -n prod-app --all quarantine- quarantined_by- security.status-
+kubectl annotate pods -n prod-app --all security.anomaly_score- security.quarantined_at-
+kubectl get pods -n prod-app --show-labels
+
+#to run end-end pipeline
+
+
+python test_local_model.py
+
+python sagemaker_single_vector_test.py
+
+python ebpf_sagemaker_streamer.py
+
+python ebpf_loadtest_scatter_pipeline.py
+
+
+
+
+Cleanup
+-----------
+$REGION = "ap-south-1"
+$CLUSTER_NAME = "eks-sec-cluster"
+aws elbv2 describe-load-balancers --region ap-south-1 --query "LoadBalancers[].LoadBalancerArn" --output text | ForEach-Object { aws elbv2 modify-load-balancer-attributes --load-balancer-arn $_ --attributes Key=deletion_protection.enabled,Value=false --region ap-south-1; aws elbv2 delete-load-balancer --load-balancer-arn $_ --region ap-south-1 }
+aws elb describe-load-balancers --region ap-south-1 --query "LoadBalancerDescriptions[].LoadBalancerName" --output text | ForEach-Object { aws elb delete-load-balancer --load-balancer-name $_ --region ap-south-1 }
+aws elbv2 describe-target-groups --region ap-south-1 --query "TargetGroups[].TargetGroupArn" --output text | ForEach-Object { aws elbv2 delete-target-group --target-group-arn $_ --region ap-south-1 }
+
+kubectl delete namespace prod-app --ignore-not-found
+
+# Delete SageMaker Endpoints, Configs, and Models
+$ENDPOINTS = (aws sagemaker list-endpoints --region $REGION --query "Endpoints[*].EndpointName" --output text)
+foreach ($ep in $ENDPOINTS -split '\s+') {
+    if ($ep) { Write-Host "Deleting SageMaker Endpoint: $ep"; aws sagemaker delete-endpoint --endpoint-name $ep --region $REGION }
+}
+
+$CONFIGS = (aws sagemaker list-endpoint-configs --region $REGION --query "EndpointConfigs[*].EndpointConfigName" --output text)
+foreach ($cfg in $CONFIGS -split '\s+') {
+    if ($cfg) { aws sagemaker delete-endpoint-config --endpoint-config-name $cfg --region $REGION }
+}
+
+$MODELS = (aws sagemaker list-models --region $REGION --query "Models[*].ModelName" --output text)
+foreach ($m in $MODELS -split '\s+') {
+    if ($m) { aws sagemaker delete-model --model-name $m --region $REGION }
+}
+
+# Delete Remediation Lambda Functions
+$LAMBDAS = (aws lambda list-functions --region $REGION --query "Functions[?contains(FunctionName, 'remediat') || contains(FunctionName, 'eks') || contains(FunctionName, 'security')].FunctionName" --output text)
+foreach ($fn in $LAMBDAS -split '\s+') {
+    if ($fn) { Write-Host "Deleting Lambda: $fn"; aws lambda delete-function --function-name $fn --region $REGION }
+}
+
+# Empty & Delete S3 Buckets
+$BUCKETS = (aws s3api list-buckets --query "Buckets[?contains(Name, 'eks') || contains(Name, 'sagemaker') || contains(Name, 'dissertation')].Name" --output text)
+foreach ($b in $BUCKETS -split '\s+') {
+    if ($b) {
+        Write-Host "Emptying & deleting S3 bucket: $b"
+        aws s3 rm "s3://$b" --recursive
+        aws s3api delete-bucket --bucket $b --region $REGION
+    }
+}
+
+# Delete CloudWatch Log Groups
+$LOG_GROUPS = (aws logs describe-log-groups --region $REGION --query "logGroups[?contains(logGroupName, '/aws/eks') || contains(logGroupName, '/aws/lambda') || contains(logGroupName, '/aws/sagemaker')].logGroupName" --output text)
+foreach ($lg in $LOG_GROUPS -split '\s+') {
+    if ($lg) { aws logs delete-log-group --log-group-name $lg --region $REGION }
+}
+
+cd C:\Users\91900\OneDrive\Desktop\BitsPilani\Dissertation\eks-security-framework\terraform
+terraform destroy -auto-approve
+
+
+# 1. Check active EC2 instances (Should return empty or []):
+aws ec2 describe-instances --region $REGION --filters "Name=instance-state-name,Values=running,pending" --query "Reservations[*].Instances[*].InstanceId"
+
+# 2. Check active NAT Gateways (Should return empty or []):
+aws ec2 describe-nat-gateways --region $REGION --filter "Name=state,Values=available,pending" --query "NatGateways[*].NatGatewayId"
+
+# 3. Check active EKS Clusters (Should return empty or []):
+aws eks list-clusters --region $REGION --query "clusters"
+
+# 4. Check active SageMaker Endpoints (Should return empty or []):
+aws sagemaker list-endpoints --region $REGION --query "Endpoints[*].EndpointName"
+
+
